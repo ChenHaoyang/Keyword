@@ -28,12 +28,14 @@ import org.apache.spark.mllib.clustering.{EMLDAOptimizer, OnlineLDAOptimizer, Di
 import org.apache.spark.mllib.linalg.{Vector, Vectors, SparseVector, Matrix, DenseMatrix,Matrices}
 import org.apache.spark.rdd.RDD
 import java.io._
+import java.nio.file.{Paths, Files}
+import java.net.URI
 import org.apache.spark.mllib.feature._
 import org.apache.spark.sql._
 import org.apache.spark.util.Utils
 import org.apache.spark.mllib.stat.{MultivariateStatisticalSummary, Statistics}
-import scala.swing._
-import scala.swing.event._
+//import scala.swing._
+//import scala.swing.event._
 import org.apache.commons.io.FileUtils
 import org.apache.commons.io.filefilter.WildcardFileFilter
 import breeze.collection.mutable.{SparseArray}
@@ -46,31 +48,130 @@ import breeze.collection.mutable.{SparseArray}
  * If you use it as a template to create your own app, please use `spark-submit` to submit your app.
  */
 object LDA4Keyword {
-  val conf = new SparkConf()
-    .setAppName(s"LDA4Keyword")
-    .setMaster("local[4]")
-    .set("spark.driver.maxResultSize", "14g")
-  val sc = new SparkContext(conf)
+
   var ldamodel: LDAModel = null
   var vocab: Map[String, Int] = null
   var vocabArray: Array[String] = null
   var pmiMatrix: Matrix = null
-  var topic_num = 100
+  var topic_num = 10
   var doc_corpus: RDD[(Long, Vector)] = null
-  val output = new BufferedWriter(new OutputStreamWriter(new FileOutputStream("result.txt", true)))
+  var topicsMat: Matrix = null
+  var output: BufferedWriter = null
+  var prefix: String="compound/"
   
+  private class NoUI (defaultParams: Params, parser:OptionParser[Params], args:Array[String], sc:SparkContext){
+    def train(){
+      parser.parse(args, defaultParams).map { params =>
+          topic_num = params.k
+          ldamodel = run(params,sc)
+          //println(ldamodel.topicsMatrix.toString())
+        }.getOrElse {
+          parser.showUsageAsError
+          sys.exit(1)
+        }
+    }
+    
+    def search(query: String){
+        var result: String = ""
+        val vocab_bd = sc.broadcast(vocab)
+        //result.text = ""
+        if(doc_corpus == null){
+          doc_corpus = sc.objectFile(prefix+"corpus")
+        }
+        if(ldamodel == null){
+          ldamodel = LocalLDAModel.load(sc, prefix+"myLDAModel")
+          vocab = sc.textFile(prefix+"vocab.txt").map(s => s.split(" ")).map(x => x(0)).zipWithIndex().map(x => (x._1, x._2.toInt)).collect.toMap
+          vocabArray = new Array[String](vocab.size)
+          vocab.foreach { case (term, i) => vocabArray(i) = term }
+        }
+        if (ldamodel.isInstanceOf[LocalLDAModel]) {
+          val locLDAModel = ldamodel.asInstanceOf[LocalLDAModel]
+          topic_num = locLDAModel.k
+          if(topicsMat == null){
+            val test = locLDAModel.describeTopics().map{ case(idxes,tokens) => idxes.zip(tokens)}
+                                                    .map{paires => paires.sortBy(_._1)}
+                                                    .map(paires => paires.map(pair => pair._2).toSeq)
+                                                    .flatMap(x => x)
+                                                    //.zipWithIndex
+            
+            topicsMat = new DenseMatrix(vocab.size, topic_num, test)
+          }
+          val query_txt = query.trim().split(Array(' ', '　'))
+          val doc_list = Seq(query_txt)
+          val new_doc = sc.parallelize(doc_list).zipWithIndex().map(_.swap)
+                          .map { case (id, tokens) =>
+                          // Filter tokens by vocabulary, and create word count vector representation of document.
+                          val wc = new HashMap[Int, Int]()
+                          tokens.foreach { term =>
+                            if (vocab_bd.value.contains(term)) {
+                              val termIndex = vocab_bd.value(term)
+                              wc(termIndex) = wc.getOrElse(termIndex, 0) + 1
+                            }
+                          }
+                          val indices = wc.keys.toArray.sorted
+                          val values = indices.map(i => wc(i).toDouble)
+                          val sb = Vectors.sparse(vocab_bd.value.size, indices, values)
+                          (id, sb)
+                        }
+          val new_doc_topics = locLDAModel.topicDistributions(new_doc).map(x => x._2).first()
+          val new_topics_words = topicsMat.multiply(new_doc_topics)
+
+          val res = new_topics_words.toArray.zipWithIndex.sortBy(_._1).takeRight(10)
+          res.foreach{
+            case(score, idx) => 
+              //println(idx)
+              result = vocabArray(idx.toInt) + " : " + score + "\n" + result
+          }
+          val pair_Map = res.map{ case(value, idx) => (idx, value)}.toMap
+          val keywords_set = new mutable.HashSet[Int]
+          res.map(pair => pair._2).foreach(elem => {
+            keywords_set.add(elem)
+          })
+
+          val query_Array = new Array[Int](query_txt.length)
+          for(i <- 0 to query_txt.length-1){
+            if(vocab.contains(query_txt(i))){
+              keywords_set.add(vocab(query_txt(i)))
+              query_Array(i) = vocab(query_txt(i))
+            }
+          }
+          val keywords_Array = keywords_set.toArray
+          val value_Array = new Array[Double](keywords_set.size)
+          for(i <- 0 to keywords_Array.length-1){
+            if(pair_Map.contains(keywords_Array(i)))
+              value_Array(i) = pair_Map(keywords_Array(i))
+            else
+              value_Array(i) = 0d
+          }
+          
+          val input_Array = Array.ofDim[(Array[Int], Array[Double])](1)
+          //println(keywords_set.size)
+          input_Array(0) = (keywords_Array, value_Array)
+          val result_pmi = pmi(sc, doc_corpus,input_Array,vocabArray.length, query_Array,10)
+          //result = result + "\r\n\r\n" + "Average PMI: " + result_pmi(0)._2
+          
+          output.write(result_pmi(0)._2 + "\n")
+          //output.write(result + "\n")
+          output.flush
+          //output.close()
+          //sc.stop
+        }
+      
+    }
+  }
   
-  private case class UI (defaultParams: Params, parser:OptionParser[Params], args:Array[String]) extends MainFrame {
+/*
+  private case class UI (defaultParams: Params, parser:OptionParser[Params], args:Array[String], sc:SparkContext) extends MainFrame {
     title = "LDA for Keywords"
     preferredSize = new Dimension(320, 480)
     val query = new TextField { columns = 32 }
     val result = new TextArea { rows = 18; lineWrap = true; wordWrap = true }
     val train = new Button("Train")
     val search = new Button("Search")
-    var topicsMat: Matrix = null
+    
     train.enabled = true
     search.enabled = true
-    query.text = "東芝 液晶テレビ"
+    query.text = "シャープ 液晶"
     contents = new BoxPanel(Orientation.Vertical) {
       contents += new Label("query:")
       contents += query
@@ -89,7 +190,7 @@ object LDA4Keyword {
         train.text = "Traing..."
         parser.parse(args, defaultParams).map { params =>
           topic_num = params.k
-          ldamodel = run(params)
+          ldamodel = run(params,sc)
           //println(ldamodel.topicsMatrix.toString())
         }.getOrElse {
           parser.showUsageAsError
@@ -118,7 +219,6 @@ object LDA4Keyword {
                                                     .map(paires => paires.map(pair => pair._2).toSeq)
                                                     .flatMap(x => x)
                                                     //.zipWithIndex
-            
             topicsMat = new DenseMatrix(vocab.size, topic_num, test)
           }
           val query_txt = query.text.trim().split(Array(' ', '　'))
@@ -155,8 +255,10 @@ object LDA4Keyword {
 
           val query_Array = new Array[Int](query_txt.length)
           for(i <- 0 to query_txt.length-1){
-            keywords_set.add(vocab(query_txt(i)))
-            query_Array(i) = vocab(query_txt(i))
+            if(vocab.contains(query_txt(i))){
+              keywords_set.add(vocab(query_txt(i)))
+              query_Array(i) = vocab(query_txt(i))
+            }
           }
           val keywords_Array = keywords_set.toArray
           val value_Array = new Array[Double](keywords_set.size)
@@ -170,25 +272,30 @@ object LDA4Keyword {
           val input_Array = Array.ofDim[(Array[Int], Array[Double])](1)
           //println(keywords_set.size)
           input_Array(0) = (keywords_Array, value_Array)
-          val result_pmi = pmi(doc_corpus,input_Array,vocabArray.length, query_Array,10)
-          //result.text = result.text + "\r\n\r\n" + "Average PMI: " + result_pmi(0)._2
+          val result_pmi = pmi(sc, doc_corpus,input_Array,vocabArray.length, query_Array,10)
+          result.text = result.text + "\r\n\r\n" + "Average PMI: " + result_pmi(0)._2
           
           output.write(result_pmi(0)._2 + "\n")
           output.write(result.text + "\n")
           output.flush
+          
         }
       }
-      case e: event.WindowClosing => {
+      case e: event.WindowClosed => {
         sc.stop
         output.close()
       }
     }
   }
+  * 
+  */
+
   private case class Params(
       input: Seq[String] = Seq.empty,
-      cutRate: Double = 0.9,
+      cutRate: Double = 0.97,
+      kappa: Double = 0.51d,
       k: Int = topic_num,
-      maxIterations: Int = 100,
+      maxIterations: Int = 20,
       docConcentration: Double = -1,
       topicConcentration: Double = -1,
       vocabSize: Int = -1,
@@ -200,18 +307,27 @@ object LDA4Keyword {
   val hashingTF = new HashingTF()
   
   def main(args: Array[String]) {
+    val conf = new SparkConf()
+      .setAppName(s"LDA4Keyword")
+      .setMaster("local[8]")
+      //.setMaster("spark://ec2-54-248-18-244.ap-northeast-1.compute.amazonaws.com:7077")
+      .set("spark.driver.maxResultSize", "10g")
+    val sc = new SparkContext(conf)
     val defaultParams = Params()
     val parser = new OptionParser[Params]("LDAExample") {
       head("LDAExample: an example LDA app for plain text data.")
-      opt[Int]("cutRate")
-        .text(s"percentage of keywords for feature. default: ${defaultParams.cutRate}")
-        .action((x, c) => c.copy(cutRate = x))
       opt[Int]("k")
         .text(s"number of topics. default: ${defaultParams.k}")
         .action((x, c) => c.copy(k = x))
       opt[Int]("maxIterations")
         .text(s"number of iterations of learning. default: ${defaultParams.maxIterations}")
         .action((x, c) => c.copy(maxIterations = x))
+      opt[Int]("cutRate")
+        .text(s"percentage of keywords for feature. default: ${defaultParams.cutRate}")
+        .action((x, c) => c.copy(cutRate = x))
+      opt[Double]("kappa")
+        .text(s"value of kappa. default: ${defaultParams.kappa}")
+        .action((x, c) => c.copy(kappa = x))
       opt[Double]("docConcentration")
         .text(s"amount of topic smoothing to use (> 1.0) (-1=auto)." +
         s"  default: ${defaultParams.docConcentration}")
@@ -248,11 +364,25 @@ object LDA4Keyword {
         .required()
         .action((x, c) => c.copy(input = c.input :+ x))
     }
-    val mainWin = new UI(defaultParams,parser,args)
-    mainWin.visible = true
+    
+    //val mainWin = new UI(defaultParams,parser,args,sc)
+    //mainWin.visible = true
+    //args.foreach { println }
     //mainWin.train.doClick()
     //mainWin.search.doClick()
-    //mainWin.close()
+    //mainWin.dispose()
+ 
+    val mainWin = new NoUI(defaultParams,parser,args,sc)
+    mainWin.train()
+    mainWin.search("二の舞")
+    mainWin.search("おばあさん")
+    mainWin.search("本田")
+    mainWin.search("日銀短観")
+    mainWin.search("国後島")
+    output.write("\n")
+    output.close()
+    sc.stop
+  
     //println(defaultParams.docConcentration)
     //println(defaultParams.topicConcentration)
     /*
@@ -265,18 +395,39 @@ object LDA4Keyword {
     * *
     */
   }
-  private def run(params: Params): LDAModel = {
+  private def run(params: Params, sc:SparkContext): LDAModel = {
     Logger.getRootLogger.setLevel(Level.WARN)
 
     // Load documents, and prepare them for LDA.
     //println(params.maxIterations)
     val preprocessStart = System.nanoTime()
-    val (corpus, actualNumTokens) =
-      preprocess(sc, params.input, params.cutRate, params.vocabSize, params.stopwordFile)
-    corpus.cache()
-    doc_corpus = corpus
-    val test_corpus = sc.objectFile[(Long, org.apache.spark.mllib.linalg.Vector)]("testdata")
-    val train_corpus = corpus.subtract(test_corpus)
+    var tokensNum: Long = 0
+   
+    //if(!Files.exists(Paths.get(URI.create("file:///root/data/corpus"))))
+    if(!Files.exists(Paths.get(prefix+"corpus")))
+    {
+      val (corpus, actualNumTokens) =
+        preprocess(sc, params.input, params.cutRate, params.vocabSize, params.stopwordFile)
+      //actualNumTokens = actualNumTokens_i
+      doc_corpus = corpus
+      doc_corpus.cache()
+      tokensNum = actualNumTokens
+      corpus.saveAsObjectFile(prefix+"corpus")
+    }
+    else{
+      vocab = sc.textFile(prefix+"vocab.txt").map(s => s.split(" ")).map(x => x(0)).zipWithIndex().map(x => (x._1, x._2.toInt)).collect.toMap
+      //vocab = sc.textFile("file:///root/data/vocab.txt").map(s => s.split(" ")).map(x => x(0)).zipWithIndex().map(x => (x._1, x._2.toInt)).collect.toMap
+      vocabArray = new Array[String](vocab.size)
+      vocab.foreach { case (term, i) => vocabArray(i) = term }
+      doc_corpus = sc.objectFile(prefix+"corpus")
+      //doc_corpus = sc.objectFile("file:///root/data/corpus")
+    }
+    
+    //val test_corpus = sc.objectFile[(Long, org.apache.spark.mllib.linalg.Vector)]("file:///root/data/testdata")
+    val test_corpus = sc.objectFile[(Long, org.apache.spark.mllib.linalg.Vector)](prefix+"testdata")
+    //val test_corpus = doc_corpus.sample(false, 0.01)
+    //test_corpus.saveAsObjectFile("testdata")
+    val train_corpus = doc_corpus.subtract(test_corpus)
     val actualCorpusSize = train_corpus.count()
     val actualVocabSize = vocabArray.size
     val preprocessElapsed = (System.nanoTime() - preprocessStart) / 1e9
@@ -284,9 +435,11 @@ object LDA4Keyword {
     println(s"Corpus summary:")
     println(s"\t Training set size: $actualCorpusSize documents")
     println(s"\t Vocabulary size: $actualVocabSize terms")
-    println(s"\t Training set size: $actualNumTokens tokens")
+    println(s"\t Training set size: $tokensNum tokens")
     println(s"\t Preprocessing time: $preprocessElapsed sec")
     println()
+    //initialize the output file writer
+    output = new BufferedWriter(new OutputStreamWriter(new FileOutputStream("result/result_" + params.k + "_" + params.kappa.toString() +".txt", true)))
     
     // Run LDA.
     val lda = new LDA()
@@ -295,6 +448,8 @@ object LDA4Keyword {
       // add (1.0 / actualCorpusSize) to MiniBatchFraction be more robust on tiny datasets.
       case "online" => new OnlineLDAOptimizer().setMiniBatchFraction(0.05 + 1.0 / actualCorpusSize)
       											.setOptimizeDocConcentration(true)
+      											.setKappa(params.kappa)
+      											//.setTau0(64)
       case _ => throw new IllegalArgumentException(
         s"Only em, online are supported but got ${params.algorithm}.")
     }
@@ -307,8 +462,8 @@ object LDA4Keyword {
     if (params.checkpointDir.nonEmpty) {
       sc.setCheckpointDir(params.checkpointDir.get)
     }
-    output.write("maxIteration : " + params.maxIterations + "\n")
-    output.write("Training time, log_perplexity, topic PMI, query PMI" + "\n")
+    output.write("TopicNum : " + params.k +"; maxIteration : " + params.maxIterations + "\n")
+    output.write("Training time, log_perplexity, topic PMI, query01 PMI, query02 PMI, query03 PMI, query04 PMI, query05 PMI" + "\n")
     
     val startTime = System.nanoTime()
     //val test_corpus = corpus.sample(withReplacement=false, fraction=0.01)
@@ -319,7 +474,7 @@ object LDA4Keyword {
     println(s"\t Training time: $elapsed sec")
     
     output.write(elapsed + "\n")
-        
+    
     if (ldaModel.isInstanceOf[DistributedLDAModel]) {
       val distLDAModel = ldaModel.asInstanceOf[DistributedLDAModel]
       val avgLogLikelihood = distLDAModel.logLikelihood / actualCorpusSize.toDouble
@@ -333,10 +488,11 @@ object LDA4Keyword {
       println()
       output.write(logPerplexity + "\n")
     }
-    // Print the topics, showing the top-weighted terms for each topic.
+ 
+  // Print the topics, showing the top-weighted terms for each topic.
 
     val topicIndices = ldaModel.describeTopics(maxTermsPerTopic = 10)
-    /*
+  /*
     val topics = topicIndices.map { case (terms, termWeights) =>
       terms.zip(termWeights).map { case (term, weight) => (term, vocabArray(term.toInt), weight) }
     }
@@ -351,28 +507,31 @@ object LDA4Keyword {
     }
     * 
     */
+  
 
     //Calculate Average PMI
     val total_pmi = sc.accumulator(0d)
     
-    val topic_pmi = pmi(corpus, topicIndices, actualVocabSize)
+    val topic_pmi = pmi(sc, doc_corpus, topicIndices, actualVocabSize)
+
+    //val pmi_vals = topic_pmi.map{ case(x,y) => y}.toSeq
     topic_pmi.foreach(pair => {
-      //println(s"PMI of Topic " + pair._1 + " " + pair._2)
+      //println(s"PMI of Topic " + pair._1 + " is " + pair._2)
       total_pmi += pair._2
     } 
     )
-    
+
     val average_pmi = total_pmi.value / topic_pmi.length
     
     println("Topic Number: " + topicIndices.length)
     println("Average PMI is: " + average_pmi)
+    //println("Median PMI is: " + median(pmi_vals))
     
     output.write(average_pmi + "\n")
     output.flush()
     
-    deleteDirectory("myLDAModel")
-    //sc.stop()
-    ldaModel.save(sc, "myLDAModel")
+    //deleteDirectory("myLDAModel")
+    //ldaModel.save(sc, "myLDAModel")
     //println(ldaModel.docConcentration)
     //println(ldaModel.topicConcentration)
     
@@ -385,22 +544,19 @@ object LDA4Keyword {
     (start+limit)*n/2
   }
   
-  def pmi(docs:RDD[(Long, Vector)],topicIndices: Array[(Array[Int], Array[Double])], vocSize: Int, query: Array[Int]=null, retrieved: Int=0): Array[(Int,Double)] ={
+  def pmi(sc:SparkContext, docs:RDD[(Long, Vector)],topicIndices: Array[(Array[Int], Array[Double])], vocSize: Int, query: Array[Int]=null, retrieved: Int=0): Array[(Int,Double)] ={
     //Load PMI Matrix if exists
     //var pMatrix = Matrices.speye(vocSize)
     val tval= seqsum(limit=vocSize)
     //val pArray = new SparseArray[Accumulator[Double]](size=seqsum(limit=vocSize))
     val topics = topicIndices.map { case (term_idxes, termWeights) => term_idxes }
     var kw_map: Array[Map[Int, Double]] = null
-    //var val_total: Double = 0d
-    //for query PMI calculation
-  
-    if(query != null){
-      kw_map = topicIndices.map { case (term_idxes, termWeights) => term_idxes.zip(termWeights).toMap }
-      //val_total = kw_map(0).values.sum
-    }
+ 
+    kw_map = topicIndices.map { case (term_idxes, termWeights) => 
+      //val total_weights = termWeights.sum
+      //val std_weights = termWeights.map(w => w / total_weights).toSeq
+      term_idxes.zip(termWeights).toMap }
 
-    
     val pMap = new HashMap[Long, Accumulator[Double]]
     val topicWords = topics.flatMap{arr => arr}.toSet.toArray.sorted//indexes of tokens
     
@@ -418,7 +574,7 @@ object LDA4Keyword {
     docs.foreach { case (docid, tokens) =>
       val tokenids = tokens.toSparse.indices.sorted
       for (i <- 0 to tokenids.length-1){
-        //token's Index
+        //token's Index(start with 0)
         val idx_i = tokenids(i).toInt
         if(topicWords.contains(idx_i)){
           val ssum = seqsum(limit=idx_i)
@@ -439,12 +595,8 @@ object LDA4Keyword {
     val pmi = topics.zipWithIndex.map{ case(tokens,idx) => 
       val tokens_sorted = tokens.sorted
       var pmi_total = 0d
-      var weight = 1d
-      var pair_num = 0L
-      if(query != null)
-        pair_num = 1//(2*tokens.length - query.length - retrieved) * query.length
-      else
-        pair_num = seqsum(limit=tokens.length)-tokens.length
+      var weight = 0d//in the case of topic PMI, weight = 1
+      var total_weight = 0d
         
       val logdocsCount = log(docs.count)
       //println("topic id : " + idx)
@@ -452,28 +604,43 @@ object LDA4Keyword {
         val ssum = seqsum(limit=tokens_sorted(i))
         //println(tokens(i))
         for(j <-0 to i){
+          //exclude the self PMI
           if(i != j){
             if(query != null){
-              if(query.contains(tokens_sorted(i)) && !query.contains(tokens_sorted(j))){
-                weight = kw_map(0)(tokens_sorted(j))// / val_total
+              val b_i = query.contains(tokens_sorted(i))
+              val b_j = query.contains(tokens_sorted(j))
+              
+              if(b_i && !b_j){
+                weight = kw_map(0)(tokens_sorted(j)) * kw_map(0)(tokens_sorted(j))// / val_total
                 //println(vocabArray(tokens_sorted(j)) + " : " + weight)
               }
-              else if(!query.contains(tokens_sorted(i)) && query.contains(tokens_sorted(j))){
-                weight = kw_map(0)(tokens_sorted(i))// / val_total
+              else if(!b_i && b_j){
+                weight = kw_map(0)(tokens_sorted(i)) * kw_map(0)(tokens_sorted(i))// / val_total
                 //println(vocabArray(tokens_sorted(i)) + " : " + weight)
               }
+              else if(!b_i && !b_j)
+                weight = kw_map(0)(tokens_sorted(i)) * kw_map(0)(tokens_sorted(j))
               else
-                weight = 0d
+                weight = 0
             }
-            if(weight != 0 && pMap(ssum+tokens_sorted(j)).value > 0)
-          	  pmi_total = (pmi_total + weight * 
-          	  (log(pMap(ssum+tokens_sorted(j)).value) + logdocsCount - 
-          	      (log(pMap(ssum+tokens_sorted(i)).value) + 
-          	          log(pMap(seqsum(limit=tokens_sorted(j))+tokens_sorted(j)).value))))
+            else{
+              weight = kw_map(idx)(tokens_sorted(i)) * kw_map(idx)(tokens_sorted(j))
+            }
+            if(weight != 0)
+            {
+              var log_part = 0d
+              if(pMap(ssum+tokens_sorted(j)).value > 0)
+              {
+                log_part = (log(pMap(ssum+tokens_sorted(i)).value) + log(pMap(seqsum(limit=tokens_sorted(j))+tokens_sorted(j)).value)
+                  - 2 * logdocsCount) / (log(pMap(ssum+tokens_sorted(j)).value) - logdocsCount)
+                pmi_total = pmi_total + weight*(-1 + log_part)
+              }
+              total_weight += weight
+            }
           }
         }
       }
-      (idx, pmi_total / pair_num)
+      (idx, pmi_total/total_weight)
     }
     pmi
     //Array.ofDim[(Int,Double)](1,1)
@@ -486,6 +653,7 @@ object LDA4Keyword {
    * 
    */
   def hashing(x:String): Int = {
+    //println(x)
     hashingTF.indexOf(x)
   }
   
@@ -503,6 +671,12 @@ object LDA4Keyword {
     }
   }
   
+  def median[T](s: Seq[T])(implicit n: Fractional[T]) = {
+    import n._
+    val (lower, upper) = s.sortWith(_<_).splitAt(s.size / 2)
+    if (s.size % 2 == 0) (lower.last + upper.head) / fromInt(2) else upper.head
+  }
+  
   /**
    * Load documents, tokenize them, create vocabulary, and prepare documents as term count vectors.
    * @return (corpus, vocabulary as array, total token count in corpus)
@@ -518,52 +692,68 @@ object LDA4Keyword {
     // this can result in a large number of small partitions, which can degrade performance.
     // In this case, consider using coalesce() to create fewer, larger partitions.
     val textRDD: RDD[String] = sc.textFile(paths.mkString(","))
-    
     val docs: RDD[Seq[String]] = textRDD.map(_.split(" ").toSeq)
+
     val hash2Word: Map[Int, String] = docs.flatMap{doc => doc}
-                                             .map{word => hashing(word) -> word}
-                                             .distinct()
-                                             .collect()
+                                             .distinct
+                                             .map{case word => hashing(word) -> word}
+                                             .collect
                                              .toMap
+                                            
     //val tt = docs.flatMap{doc => doc}
+    //println("1")
     val tf:RDD[Vector] = hashingTF.transform(docs)
     tf.cache()
-    val idf = new IDF(minDocFreq = 3).fit(tf)
+    //println("2")
+    val idf = new IDF(minDocFreq = 10).fit(tf)
     val tfidf: RDD[Vector] = idf.transform(tf)
+    //println("3")
     //idx is the hashcode of the term
     val TF_IDF_IDX = tfidf.map(vec => vec.toSparse.indices)
                           .flatMap(idx => idx)
+    //println("4")
     val TF_IDF_VAL = tfidf.map(vec => vec.toSparse.values)
                                           .flatMap(value => value)
+    //println("5")
     val mean_TFIDF = TF_IDF_IDX.zip(TF_IDF_VAL)
                                       .mapValues(x => (x, 1))
                                       .reduceByKey((x, y) => (x._1 + y._1, x._2 + y._2))
                                       .map(pair => pair._1 -> (pair._2._1 / pair._2._2))
-                                      
-    val TF_IDF_SUM:Double = mean_TFIDF.map(pair => pair._2).sum
+    //println("6") 
+    mean_TFIDF.cache()
+    //mean_TFIDF.count
+    //println("7")
+    val TF_IDF_SUM:Double = mean_TFIDF.map(pair => pair._2).collect().sum
+    println(TF_IDF_SUM)
+    //val tfidfsum = sc.broadcast(TF_IDF_SUM)
     
     val percent_TFIDF_Sorted = mean_TFIDF.map(pair => pair._1 -> (pair._2 / TF_IDF_SUM))
                                       .sortBy(_._2,false)
+    //percent_TFIDF_Sorted.cache()
+    //println("8")
     var total:Double = 0d
-    var count:Int = 0
+    var count: Int = 0
     val checkNG = (x:(Int,Double)) => {
       try{
           total = total + x._2
           if(total <= cutRate)
-            count = count +1
+            count = count + 1
       }
       catch{
         case ex: Exception => {println(ex);false}
       }
     }
-    percent_TFIDF_Sorted.collect().foreach(checkNG)
-    val selected_feature = percent_TFIDF_Sorted.take(count)
+    val sorted_array = percent_TFIDF_Sorted.collect()
+    sorted_array.foreach(checkNG)
+    //println("9")
+    val selected_feature = sorted_array.take(count)
+    //println("10")
     val selected_feature_map = selected_feature.toMap
     val selected_feature_idx = selected_feature.map(pair => pair._1)
                                                 .toSet
  
-
-    val summary: MultivariateStatisticalSummary = Statistics.colStats(tfidf)
+    //println("TF-IDF over")
+    //val summary: MultivariateStatisticalSummary = Statistics.colStats(tfidf)
     
     // Split text into words
     val tokenizer = new SimpleTokenizer(sc, stopwordFile)
@@ -593,30 +783,33 @@ object LDA4Keyword {
       vocab = tmpSortedWC.map(_._1).zipWithIndex.toMap
       (tmpSortedWC.map(_._2).sum)
     }
-    
+    val vocab_bd = sc.broadcast(vocab)
     val documents = tokenized.map { case (id, tokens) =>
       // Filter tokens by vocabulary, and create word count vector representation of document.
       val wc = new HashMap[Int, Int]()
       tokens.foreach { term =>
-        if (vocab.contains(term)) {
-          val termIndex = vocab(term)
+        if (vocab_bd.value.contains(term)) {
+          val termIndex = vocab_bd.value(term)
           wc(termIndex) = wc.getOrElse(termIndex, 0) + 1
         }
       }
       val indices = wc.keys.toArray.sorted
       val values = indices.map(i => wc(i).toDouble)
-      val sb = Vectors.sparse(vocab.size, indices, values)
+      val sb = Vectors.sparse(vocab_bd.value.size, indices, values)
       (id, sb)
     }
-    val writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream("vocab.txt")))
+    //println("start write vocab")
+    val writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(prefix+"vocab.txt")))
     vocabArray = new Array[String](vocab.size)
+    print(vocab.size)
     vocab.foreach { case (term, i) => 
       vocabArray(i) = term
       }
     vocabArray.foreach { x => writer.write(x + "\n") }
     writer.close()
-    deleteDirectory("corpus")
-    documents.saveAsObjectFile("corpus")
+    //println("vocab write over")
+    //deleteDirectory("corpus")
+    //documents.saveAsObjectFile("corpus")
     (documents, selectedTokenCount)
   }
 }
